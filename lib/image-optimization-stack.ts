@@ -301,7 +301,7 @@ export class ImageOptimizationStack extends Stack {
         {
           defaultTtl: Duration.hours(24),
           maxTtl: Duration.days(365),
-          minTtl: Duration.seconds(0),
+          minTtl: Duration.seconds(60),
         }
       ),
       functionAssociations: [
