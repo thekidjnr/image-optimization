@@ -43,6 +43,9 @@ var LAMBDA_MEMORY = "1500";
 var LAMBDA_TIMEOUT = "60";
 // Whether to deploy a sample website referenced in https://aws.amazon.com/blogs/networking-and-content-delivery/image-optimization-using-amazon-cloudfront-and-aws-lambda/
 var DEPLOY_SAMPLE_WEBSITE = "false";
+// Lenslyst: SSM parameter (SecureString JSON: accountId, accessKeyId, secretAccessKey, buckets) with
+// read-only Cloudflare R2 credentials, for gallery photo originals stored on R2. Optional.
+var R2_CONFIG_PARAMETER = "";
 
 type ImageDeliveryCacheBehaviorConfig = {
   origin: any;
@@ -56,6 +59,7 @@ type ImageDeliveryCacheBehaviorConfig = {
 type LambdaEnv = {
   originalImageBucketName: string;
   secondaryBucketName?: string;
+  r2ConfigParameter?: string;
   transformedImageBucketName?: any;
   transformedImageCacheTTL: string;
   maxImageSize: string;
@@ -90,6 +94,8 @@ export class ImageOptimizationStack extends Stack {
       this.node.tryGetContext("MAX_IMAGE_SIZE") || MAX_IMAGE_SIZE;
     DEPLOY_SAMPLE_WEBSITE =
       this.node.tryGetContext("DEPLOY_SAMPLE_WEBSITE") || DEPLOY_SAMPLE_WEBSITE;
+    R2_CONFIG_PARAMETER =
+      this.node.tryGetContext("R2_CONFIG_PARAMETER") || R2_CONFIG_PARAMETER;
 
     // deploy a sample website for testing if required
     if (DEPLOY_SAMPLE_WEBSITE === "true") {
@@ -218,6 +224,19 @@ export class ImageOptimizationStack extends Stack {
       s3ReadLenslystProductionPolicy,
       s3ReadLenslystDevelopmentPolicy
     );
+
+    // Lenslyst: read the R2 credentials for photo originals on Cloudflare R2. A SecureString under
+    // the default aws/ssm key needs no separate KMS permission.
+    if (R2_CONFIG_PARAMETER) {
+      const parameterName = R2_CONFIG_PARAMETER.startsWith("/") ? R2_CONFIG_PARAMETER : `/${R2_CONFIG_PARAMETER}`;
+      lambdaEnv.r2ConfigParameter = parameterName;
+      iamPolicyStatements.push(
+        new iam.PolicyStatement({
+          actions: ["ssm:GetParameter"],
+          resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${parameterName}`],
+        })
+      );
+    }
 
     // Create Lambda for image processing
     const sharpLayer = new lambda.LayerVersion(this, "SharpLayer", {

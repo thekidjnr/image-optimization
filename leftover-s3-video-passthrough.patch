@@ -1,0 +1,128 @@
+Leftovers from the abandoned attempt (2026-09-22) to serve video straight from S3 through this
+CloudFront distribution. Never deployed; video now plays from Cloudflare Stream instead. Set
+aside on 2026-09-24 before deploying R2 read access for photo originals, because it would have:
+renamed the stack (ImgTransformationStack -> ImgTransformationStack-Dev/-Prod, i.e. a brand-new
+distribution and domain), dropped the lenslyst-development fallback bucket, and added video
+passthrough behaviors. Applies to the committed code (git apply this file on a clean checkout).
+
+--- a/bin/image-optimization.ts
++++ b/bin/image-optimization.ts
+@@ -3,9 +3,15 @@
+ import * as cdk from 'aws-cdk-lib';
+ import { ImageOptimizationStack } from '../lib/image-optimization-stack';
+ 
+-
+ const app = new cdk.App();
+-new ImageOptimizationStack(app, 'ImgTransformationStack', {
+ 
+-});
++const env = app.node.tryGetContext('ENV') || 'dev';
++const bucket = app.node.tryGetContext('S3_IMAGE_BUCKET_NAME');
+ 
++if (!bucket) {
++  throw new Error('S3_IMAGE_BUCKET_NAME context variable is required');
++}
++
++const stackName = env === 'prod' ? 'ImgTransformationStack-Prod' : 'ImgTransformationStack-Dev';
++
++new ImageOptimizationStack(app, stackName, {});
+--- a/lib/image-optimization-stack.ts
++++ b/lib/image-optimization-stack.ts
+@@ -187,8 +187,7 @@
+ 
+     // prepare env variable for Lambda
+     const lambdaEnv: LambdaEnv = {
+-      originalImageBucketName: "lenslyst-production",
+-      secondaryBucketName: "lenslyst-development", // optional
++      originalImageBucketName: S3_IMAGE_BUCKET_NAME,
+       transformedImageCacheTTL: S3_TRANSFORMED_IMAGE_CACHE_TTL,
+       maxImageSize: MAX_IMAGE_SIZE,
+     };
+@@ -196,29 +195,19 @@
+       lambdaEnv.transformedImageBucketName = transformedImageBucket.bucketName;
+ 
+     // IAM policy to read from the S3 bucket containing the original images
+-    const s3ReadLenslystProductionPolicy = new iam.PolicyStatement({
++    const s3ReadOriginalImagesPolicy = new iam.PolicyStatement({
+       actions: ["s3:GetObject", "s3:ListBucket"],
+       resources: [
+-        "arn:aws:s3:::lenslyst-production",
+-        "arn:aws:s3:::lenslyst-production/*",
+-      ],
+-    });
+-
+-    const s3ReadLenslystDevelopmentPolicy = new iam.PolicyStatement({
+-      actions: ["s3:GetObject", "s3:ListBucket"],
+-      resources: [
+-        "arn:aws:s3:::lenslyst-development",
+-        "arn:aws:s3:::lenslyst-development/*",
++        `arn:aws:s3:::${S3_IMAGE_BUCKET_NAME}`,
++        `arn:aws:s3:::${S3_IMAGE_BUCKET_NAME}/*`,
+       ],
+     });
+ 
+     // statements of the IAM policy to attach to Lambda
+     var iamPolicyStatements = [];
+-    iamPolicyStatements.push(
+-      s3ReadLenslystProductionPolicy,
+-      s3ReadLenslystDevelopmentPolicy
+-    );
++    iamPolicyStatements.push(s3ReadOriginalImagesPolicy);
+ 
++
+     // Create Lambda for image processing
+     const sharpLayer = new lambda.LayerVersion(this, "SharpLayer", {
+       code: lambda.Code.fromAsset("layers/sharp"), // <-- this is your local layer path
+@@ -376,6 +365,52 @@
+       sourceArn: `arn:aws:cloudfront::${this.account}:distribution/${imageDelivery.distributionId}`,
+     });
+ 
++    // Video passthrough — bypass the image-processing Lambda entirely for video files.
++    //
++    // Videos are uploaded into the exact same bucket/folder layout as photos
++    // (workspaces/{workspaceId}/galleries/{galleryId}/files/{id}.ext — see
++    // lens_server/src/controllers/video.controller.ts and lens_dashboard/context/UploadContext.tsx),
++    // so origin routing can't key off a path prefix. It keys off the file extension instead:
++    // any request whose path ends in a known video extension is served straight from the
++    // original S3 bucket via its own cache behavior, skipping the CloudFront Function rewrite
++    // and the Sharp/Lambda pipeline (which can't parse video bytes and returns 400 for them).
++    const videoOrigin = origins.S3BucketOrigin.withOriginAccessControl(originalImageBucket, {
++      originAccessLevels: [cloudfront.AccessLevel.READ],
++    });
++
++    const VIDEO_PATH_PATTERNS = [
++      "*.mp4", "*.mov", "*.webm", "*.m4v",
++      "*.avi", "*.mkv", "*.wmv", "*.3gp", "*.ogv", "*.flv",
++    ];
++
++    for (const pattern of VIDEO_PATH_PATTERNS) {
++      imageDelivery.addBehavior(pattern, videoOrigin, {
++        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
++        compress: false,
++        cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
++      });
++    }
++
++    // `originalImageBucket` is imported by name (S3_IMAGE_BUCKET_NAME), not owned by this
++    // stack, so CDK cannot attach a bucket policy to it automatically —
++    // `withOriginAccessControl` above will emit a synth-time warning and grant nothing.
++    // Before deploying, merge this statement into that bucket's policy by hand (or via
++    // `aws s3api put-bucket-policy`); without it every video request will get an S3
++    // AccessDenied instead of today's 400 from the image Lambda.
++    new CfnOutput(this, "VideoOriginBucketPolicyStatementNeeded", {
++      description: `Merge into the bucket policy for ${S3_IMAGE_BUCKET_NAME} — CDK can't manage an imported bucket's policy automatically`,
++      value: JSON.stringify({
++        Sid: "AllowCloudFrontVideoOriginRead",
++        Effect: "Allow",
++        Principal: { Service: "cloudfront.amazonaws.com" },
++        Action: "s3:GetObject",
++        Resource: `arn:aws:s3:::${S3_IMAGE_BUCKET_NAME}/*`,
++        Condition: {
++          StringEquals: { "AWS:SourceArn": imageDelivery.distributionArn },
++        },
++      }),
++    });
++
+     new CfnOutput(this, "ImageDeliveryDomain", {
+       description: "Domain name of image delivery",
+       value: imageDelivery.distributionDomainName,
