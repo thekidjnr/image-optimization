@@ -41,6 +41,9 @@ var MAX_IMAGE_SIZE = "4700000";
 // Lambda Parameters
 var LAMBDA_MEMORY = "1500";
 var LAMBDA_TIMEOUT = "60";
+// Lenslyst: Graviton (arm64) costs 20% less per GB-second than x86_64. The sharp layer carries
+// both builds, so `-c LAMBDA_ARCH=x86_64` switches back without rebuilding it.
+var LAMBDA_ARCH = "arm64";
 // Whether to deploy a sample website referenced in https://aws.amazon.com/blogs/networking-and-content-delivery/image-optimization-using-amazon-cloudfront-and-aws-lambda/
 var DEPLOY_SAMPLE_WEBSITE = "false";
 // Lenslyst: SSM parameter (SecureString JSON: accountId, accessKeyId, secretAccessKey, buckets) with
@@ -90,6 +93,7 @@ export class ImageOptimizationStack extends Stack {
     LAMBDA_MEMORY = this.node.tryGetContext("LAMBDA_MEMORY") || LAMBDA_MEMORY;
     LAMBDA_TIMEOUT =
       this.node.tryGetContext("LAMBDA_TIMEOUT") || LAMBDA_TIMEOUT;
+    LAMBDA_ARCH = this.node.tryGetContext("LAMBDA_ARCH") || LAMBDA_ARCH;
     MAX_IMAGE_SIZE =
       this.node.tryGetContext("MAX_IMAGE_SIZE") || MAX_IMAGE_SIZE;
     DEPLOY_SAMPLE_WEBSITE =
@@ -242,7 +246,8 @@ export class ImageOptimizationStack extends Stack {
     const sharpLayer = new lambda.LayerVersion(this, "SharpLayer", {
       code: lambda.Code.fromAsset("layers/sharp"), // <-- this is your local layer path
       compatibleRuntimes: [lambda.Runtime.NODEJS_20_X],
-      description: "Locally bundled sharp layer for x64",
+      compatibleArchitectures: [lambda.Architecture.X86_64, lambda.Architecture.ARM_64],
+      description: "Locally bundled sharp layer for x64 and arm64",
     });
 
     var lambdaProps = {
@@ -251,6 +256,7 @@ export class ImageOptimizationStack extends Stack {
       code: lambda.Code.fromAsset("functions/image-processing"),
       timeout: Duration.seconds(parseInt(LAMBDA_TIMEOUT)),
       memorySize: parseInt(LAMBDA_MEMORY),
+      architecture: LAMBDA_ARCH === "x86_64" ? lambda.Architecture.X86_64 : lambda.Architecture.ARM_64,
       environment: lambdaEnv,
       layers: [sharpLayer],
       logRetention: logs.RetentionDays.ONE_DAY,
@@ -284,8 +290,9 @@ export class ImageOptimizationStack extends Stack {
       });
 
       // write policy for Lambda on the s3 bucket for transformed images
+      // Read too: resizes start from the master saved there (functions/image-processing)
       var s3WriteTransformedImagesPolicy = new iam.PolicyStatement({
-        actions: ["s3:PutObject"],
+        actions: ["s3:PutObject", "s3:GetObject"],
         resources: ["arn:aws:s3:::" + transformedImageBucket.bucketName + "/*"],
       });
       iamPolicyStatements.push(s3WriteTransformedImagesPolicy);

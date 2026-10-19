@@ -31,7 +31,11 @@ function getR2Source() {
     .send(new GetParameterCommand({ Name: R2_CONFIG_PARAMETER, WithDecryption: true }))
     .then((res) => {
       const config = JSON.parse(res.Parameter.Value);
-      const buckets = config.buckets ?? (config.bucket ? [config.bucket] : []);
+      // Production's bucket first: nearly every read is a production photo, and each bucket tried
+      // before the one that has it is a wasted round trip to R2
+      const buckets = [...(config.buckets ?? (config.bucket ? [config.bucket] : []))].sort(
+        (a, b) => Number(/prod/i.test(b)) - Number(/prod/i.test(a))
+      );
       if (!buckets.length) throw new Error(`${R2_CONFIG_PARAMETER} names no R2 buckets`);
       return {
         buckets,
@@ -50,6 +54,54 @@ function getR2Source() {
       throw err;
     });
   return r2Source;
+}
+
+// Lenslyst: a smaller copy of each large original (the "master"), kept in the transformed-images
+// bucket under _masters/. A camera original is often 15-30 MB, and every size of a photo (tiles,
+// full screen, dashboard thumbnails, AVIF and WebP of each) used to download it again from R2:
+// 70% of downloads were repeats, and the waiting is billed. The first resize of a photo saves the
+// master; every later one up to MASTER_MAX starts from it (~1 MB, same region). It expires with
+// the rest of that bucket, and is simply made again on the next resize after that. Request paths
+// always end in an operations segment (url-rewrite), so a master can't be requested directly.
+const MASTER_MAX = 2560;
+const MASTER_MIN_BYTES = 1.5 * 1024 * 1024; // smaller originals are quick to fetch as they are
+const MASTER_FORMATS = new Set(["jpeg", "png", "webp", "heif", "tiff"]);
+const masterKey = (key) => `_masters/${key}`;
+
+/** Whether a request can be served from the master: a resize that fits inside it. */
+const fitsMaster = (ops) => {
+  const width = ops.width ? parseInt(ops.width) : 0;
+  const height = ops.height ? parseInt(ops.height) : 0;
+  return (width > 0 || height > 0) && width <= MASTER_MAX && height <= MASTER_MAX;
+};
+
+/** The saved master, or null when there's none yet (or it can't be read: the original then serves). */
+async function readMaster(key) {
+  if (!S3_TRANSFORMED_IMAGE_BUCKET) return null;
+  try {
+    const out = await s3Client.send(new GetObjectCommand({ Bucket: S3_TRANSFORMED_IMAGE_BUCKET, Key: masterKey(key) }));
+    return { body: await out.Body.transformToByteArray(), contentType: out.ContentType };
+  } catch {
+    return null;
+  }
+}
+
+/** Save the master for an original worth one (large, still, a format worth keeping). Never throws. */
+async function saveMaster(key, original, metadata, bytes) {
+  if (!S3_TRANSFORMED_IMAGE_BUCKET) return;
+  const large = bytes >= MASTER_MIN_BYTES || (metadata.width ?? 0) > MASTER_MAX || (metadata.height ?? 0) > MASTER_MAX;
+  if (!large || !MASTER_FORMATS.has(metadata.format) || (metadata.pages ?? 1) > 1) return;
+  try {
+    // Upright (EXIF orientation applied), so a resize from it needs no rotation
+    let master = original.clone().rotate().resize({ width: MASTER_MAX, height: MASTER_MAX, fit: "inside", withoutEnlargement: true });
+    const contentType = metadata.hasAlpha ? "image/webp" : "image/jpeg";
+    master = metadata.hasAlpha ? master.webp({ quality: 90, alphaQuality: 100 }) : master.jpeg({ quality: 90 });
+    await s3Client.send(
+      new PutObjectCommand({ Bucket: S3_TRANSFORMED_IMAGE_BUCKET, Key: masterKey(key), Body: await master.toBuffer(), ContentType: contentType })
+    );
+  } catch (error) {
+    logError("Could not save the master", error);
+  }
 }
 
 const isNotFound = (err) => err && (err.name === "NoSuchKey" || err.name === "NotFound" || err.$metadata?.httpStatusCode === 404);
@@ -105,30 +157,44 @@ exports.handler = async (event) => {
   imagePathArray.shift();
   var originalImagePath = imagePathArray.join("/");
 
+  // the requested operations
+  const operationsJSON = Object.fromEntries(
+    operationsPrefix.split(",").map((operation) => operation.split("="))
+  );
+
   var startTime = performance.now();
-  // Downloading original image
+  // The master when there is one and it's big enough, otherwise the original
   let originalImageBody;
   let contentType;
-  try {
-    const original = await fetchOriginal(originalImagePath);
-    if (!original) return sendError(404, "The requested image does not exist", originalImagePath);
-    originalImageBody = original.body;
-    contentType = original.contentType;
-  } catch (error) {
-    return sendError(500, "Error downloading original image", error);
+  let source = "original";
+  const master = fitsMaster(operationsJSON) ? await readMaster(originalImagePath) : null;
+  if (master) {
+    originalImageBody = master.body;
+    contentType = master.contentType;
+    source = "master";
+  } else {
+    try {
+      const original = await fetchOriginal(originalImagePath);
+      if (!original) return sendError(404, "The requested image does not exist", originalImagePath);
+      originalImageBody = await original.body;
+      contentType = original.contentType;
+    } catch (error) {
+      return sendError(500, "Error downloading original image", error);
+    }
   }
-  let transformedImage = Sharp(await originalImageBody, {
+  let transformedImage = Sharp(originalImageBody, {
     failOn: "none",
     animated: true,
   });
   // Get image orientation to rotate if needed
   const imageMetadata = await transformedImage.metadata();
-  // execute the requested operations
-  const operationsJSON = Object.fromEntries(
-    operationsPrefix.split(",").map((operation) => operation.split("="))
-  );
+  // First resize from an original: save the master alongside, so the next sizes skip the download
+  const savingMaster =
+    source === "original" && fitsMaster(operationsJSON)
+      ? saveMaster(originalImagePath, transformedImage, imageMetadata, originalImageBody.byteLength)
+      : null;
   // variable holding the server timing header value
-  var timingLog = "img-download;dur=" + parseInt(performance.now() - startTime);
+  var timingLog = `img-download;dur=${parseInt(performance.now() - startTime)};desc=${source}`;
   startTime = performance.now();
   try {
     // check if resizing is requested
@@ -178,6 +244,8 @@ exports.handler = async (event) => {
       if (contentType === "image/svg+xml") contentType = "image/png";
     }
     transformedImage = await transformedImage.toBuffer();
+    // The master finishes before the response (the container may freeze right after)
+    if (savingMaster) await savingMaster;
   } catch (error) {
     return sendError(500, "error transforming image", error);
   }
