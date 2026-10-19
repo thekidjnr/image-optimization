@@ -233,12 +233,12 @@ exports.handler = async (event) => {
           contentType = "image/jpeg";
           isLossy = true;
       }
-      if (operationsJSON["quality"] && isLossy) {
-        transformedImage = transformedImage.toFormat(operationsJSON["format"], {
-          quality: parseInt(operationsJSON["quality"]),
-        });
-      } else
-        transformedImage = transformedImage.toFormat(operationsJSON["format"]);
+      const formatOptions = {};
+      if (operationsJSON["quality"] && isLossy) formatOptions.quality = parseInt(operationsJSON["quality"]);
+      // Lenslyst: AVIF at sharp's default effort (4) took 1.7 s at 1200px and 4.6 s at 1600px here;
+      // effort 2 is ~8x faster for about the same size and quality
+      if (operationsJSON["format"] === "avif") formatOptions.effort = 2;
+      transformedImage = transformedImage.toFormat(operationsJSON["format"], formatOptions);
     } else {
       /// If not format is precised, Sharp converts svg to png by default https://github.com/aws-samples/image-optimization/issues/48
       if (contentType === "image/svg+xml") contentType = "image/png";
